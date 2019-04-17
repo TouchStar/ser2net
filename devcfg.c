@@ -39,6 +39,10 @@
 
 #include <assert.h>
 
+#ifdef linux
+#include <linux/lp.h>
+#endif /* linux */
+
 struct devcfg_data {
     /* Information about the terminal device. */
     char           *devname;		/* The full path to the device */
@@ -1050,6 +1054,21 @@ static int devcfg_get_modem_state(struct devio *io, unsigned char *modemstate)
     return 0;
 }
 
+static int devcfg_get_printer_status(struct devio *io, int *status)
+{
+    struct devcfg_data *d = io->my_data;
+    int val;
+
+    if (ioctl(d->devfd, LPGETSTATUS, &val))
+        return -1;
+
+    *status = 0;
+    if (val)
+        *status = val;
+
+    return 0;
+}
+
 static int devcfg_baud_rate(struct devio *io, int *val, int cisco, int *bps)
 {
     struct devcfg_data *d = io->my_data;
@@ -1388,6 +1407,7 @@ static struct devio_f devcfg_io_f = {
     .except_handler_enable = devcfg_except_handler_enable,
     .send_break = devcfg_send_break,
     .get_modem_state = devcfg_get_modem_state,
+    .get_printer_status = devcfg_get_printer_status,
     .set_devcontrol = devcfg_set_devcontrol,
     .show_devcontrol = devcfg_show_devcontrol,
     .show_devcfg = devcfg_show_devcfg,

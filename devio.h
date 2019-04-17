@@ -54,6 +54,7 @@ struct devio_f {
     void (*except_handler_enable)(struct devio *io, int enabled);
     int (*send_break)(struct devio *io);
     int (*get_modem_state)(struct devio *io, unsigned char *val);
+    int (*get_printer_status)(struct devio *io, int *status);
     int (*set_devcontrol)(struct devio *io, const char *controls);
     void (*show_devcontrol)(struct devio *io, struct absout *out);
     void (*show_devcfg)(struct devio *io, struct absout *out);

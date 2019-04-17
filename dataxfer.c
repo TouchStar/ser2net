@@ -72,7 +72,9 @@ char *state_str[] = { "unconnected", "waiting input", "waiting output",
 #define PORT_RAWLP		2 /* Port will not do telnet negotiation and
                                      termios setting, open for output only. */
 #define PORT_TELNET		3 /* Port will do telnet negotiation. */
-char *enabled_str[] = { "off", "raw", "rawlp", "telnet" };
+#define PORT_USBLP		4 /* Same as PORT_RAWLP except port will additionally
+                                     check printer status. */
+char *enabled_str[] = { "off", "raw", "rawlp", "telnet", "usblp" };
 
 typedef struct trace_info_s
 {
@@ -364,6 +366,10 @@ struct port_info
      */
     struct led_s *led_tx;
     struct led_s *led_rx;
+
+    /* Check device status */
+    bool enable_status_check;
+    int last_printerstatus;
 };
 
 #define for_each_connection(port, netcon) \
@@ -1182,7 +1188,7 @@ handle_net_fd_read(int fd, void *data)
 void io_enable_read_handler(port_info_t *port)
 {
     port->io.f->read_handler_enable(&port->io,
-				    port->enabled != PORT_RAWLP);
+				port->enabled != PORT_RAWLP && port->enabled != PORT_USBLP);
 }
 
 /*
@@ -1813,6 +1819,13 @@ process_str_to_buf(port_info_t *port, net_info_t *netcon, const char *str)
     return buf;
 }
 
+static char hexchars[] = "0123456789ABCDEF";
+
+static char nibbletohex(unsigned char n)
+{
+    return hexchars[n & 0xF];
+}
+
 static void
 open_trace_file(port_info_t *port,
                 trace_info_t *t,
@@ -1970,6 +1983,7 @@ setup_port(port_info_t *port, net_info_t *netcon, bool is_reconfig)
 	    port->dev_write_handler = handle_dev_fd_normal_write;
 
 	port->io.read_handler = (port->enabled == PORT_RAWLP
+				 || port->enabled == PORT_USBLP
 				 ? NULL
 				 : handle_dev_fd_read);
 	port->io.write_handler = handle_dev_fd_write;
@@ -1993,6 +2007,7 @@ setup_port(port_info_t *port, net_info_t *netcon, bool is_reconfig)
     sel_set_fd_except_handler(ser2net_sel, netcon->fd,
 			      SEL_FD_HANDLER_ENABLED);
     port->net_to_dev_state = PORT_WAITING_INPUT;
+    port->last_printerstatus = -1;
 
     if (port->enabled == PORT_TELNET) {
 	telnet_init(&netcon->tn_data, netcon, telnet_output_ready,
@@ -2718,7 +2733,7 @@ change_port_state(struct absout *eout, port_info_t *port, int state,
 	}
     } else {
 	if (port->enabled == PORT_DISABLED) {
-	    if (state == PORT_RAWLP)
+	    if (state == PORT_RAWLP || state == PORT_USBLP)
 		port->io.read_disabled = 1;
 	    else
 		port->io.read_disabled = 0;
@@ -3163,6 +3178,49 @@ got_timeout(struct selector_s *sel,
 	}
     }
 
+    if (port->enabled == PORT_USBLP && port->enable_status_check) {
+        int printerstatus = 0;
+        int err = port->io.f->get_printer_status(&port->io, &printerstatus);
+        
+        if (printerstatus != port->last_printerstatus) {
+            struct sbuf *buf;
+            int len = 11;
+            char *data = malloc(len);
+            
+            data[0] = err ? 'E' : 'S';
+            data[1] = nibbletohex(printerstatus >> 28);
+            data[2] = nibbletohex(printerstatus >> 24);
+            data[3] = nibbletohex(printerstatus >> 20);
+            data[4] = nibbletohex(printerstatus >> 16);
+            data[5] = nibbletohex(printerstatus >> 12);
+            data[6] = nibbletohex(printerstatus >> 8);
+            data[7] = nibbletohex(printerstatus >> 4);
+            data[8] = nibbletohex(printerstatus);
+            data[9] = '\n';
+            data[10] = '\0';
+
+            buf = malloc(sizeof(*buf));
+            buffer_init(buf, (unsigned char *)data, len);
+            buf->cursize = len;
+
+            port->last_printerstatus = printerstatus;
+
+            for_each_connection(port, netcon) {
+                if (netcon->fd == -1)
+                    continue;
+                net_fd_write(port, netcon, buf, &buf->pos);
+                buf->pos = 0;
+            }
+
+            free(data);
+            free(buf);
+            buf = NULL;
+
+            if (err)
+                shutdown_port(port, "dev ioctl error");
+        }
+    }
+
     sel_get_monotonic_time(&then);
     then.tv_sec += 1;
     sel_start_timer(port->timer, &then);
@@ -3502,6 +3560,10 @@ portconfig(struct absout *eout,
     } else if (strcmp(state, "rawlp") == 0) {
 	new_port->enabled = PORT_RAWLP;
 	new_port->io.read_disabled = 1;
+    } else if (strcmp(state, "usblp") == 0) {
+	new_port->enabled = PORT_USBLP;
+	new_port->io.read_disabled = 1;
+	new_port->enable_status_check = 1;
     } else if (strcmp(state, "telnet") == 0) {
 	new_port->enabled = PORT_TELNET;
     } else if (strcmp(state, "off") == 0) {
@@ -3752,7 +3814,7 @@ showshortport(struct controller_info *cntlr, port_info_t *port)
     controller_outputf(cntlr, "%9d ", port->dev_bytes_received);
     controller_outputf(cntlr, "%9d ", port->dev_bytes_sent);
 
-    if (port->enabled != PORT_RAWLP) {
+    if (port->enabled != PORT_RAWLP && port->enabled != PORT_USBLP) {
 	port->io.f->show_devcfg(&port->io, &out);
 	need_space = 1;
     }
@@ -3811,7 +3873,7 @@ showport(struct controller_info *cntlr, port_info_t *port)
 	controller_outputf(cntlr, "  device: %s\r\n", port->io.devname);
 
     controller_outputf(cntlr, "  device config: ");
-    if (port->enabled == PORT_RAWLP) {
+    if (port->enabled == PORT_RAWLP || port->enabled == PORT_USBLP) {
 	controller_outputf(cntlr, "none\r\n");
     } else {
 	port->io.f->show_devcfg(&port->io, &out);
@@ -4041,6 +4103,8 @@ setportenable(struct controller_info *cntlr, char *portspec, char *enable)
 	new_enable = PORT_RAW;
     } else if (strcmp(enable, "rawlp") == 0) {
 	new_enable = PORT_RAWLP;
+	} else if (strcmp(enable, "usblp") == 0) {
+	new_enable = PORT_USBLP;
     } else if (strcmp(enable, "telnet") == 0) {
 	new_enable = PORT_TELNET;
     } else {
